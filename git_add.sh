@@ -40,9 +40,20 @@ backup_file() {
     fi
 }
 
+read_or_exit() {
+    local prompt="$1" out_var="$2" value=""
+    read -r -p "$prompt" value
+    if [ "$value" = $'\e' ]; then
+        echo
+        warn "检测到 ESC，已退出脚本。"
+        exit 0
+    fi
+    printf -v "$out_var" '%s' "$value"
+}
+
 confirm() {
     local ans
-    read -r -p "$1 [y/N]: " ans
+    read_or_exit "$1 [y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]]
 }
 
@@ -50,11 +61,11 @@ ask() {
     # 提示走 stderr(read -p 自带),只有最终值走 stdout,方便 $() 捕获
     local prompt="$1" default="${2:-}" value
     if [ -n "$default" ]; then
-        read -r -p "$prompt [$default]: " value
+        read_or_exit "$prompt [$default]: " value
         printf '%s' "${value:-$default}"
     else
         while true; do
-            read -r -p "$prompt: " value
+            read_or_exit "$prompt: " value
             if [ -n "$value" ]; then
                 printf '%s' "$value"
                 return
@@ -154,7 +165,7 @@ check_deps() {
     local mode="${1:-setup}"
     local missing=()
     local deps=()
-    if [ "$mode" = "delete" ]; then
+    if [ "$mode" = "delete" ] || [ "$mode" = "view" ]; then
         deps=(git awk)
     else
         deps=(git gh ssh-keygen ssh-add awk)
@@ -283,11 +294,42 @@ choose_mode() {
     echo "================================================================"
     echo "  1) 配置/更新双账号(默认)"
     echo "  2) 删除某一个账号的配置"
-    read -r -p "请选择 [1/2]: " m
+    echo "  3) 查看当前配置(只读)"
+    read_or_exit "请选择 [1/2/3]: " m
     case "$m" in
         2) MODE="delete" ;;
+        3) MODE="view" ;;
         *) MODE="setup" ;;
     esac
+}
+
+view_current_config() {
+    local i user alias cfg email name dir key
+    echo "================================================================"
+    echo "  当前配置(只读)"
+    echo "================================================================"
+    if [ ${#EXISTING_USERS[@]} -eq 0 ]; then
+        echo "未检测到由本脚本管理的账号配置。"
+        return 0
+    fi
+    for i in "${!EXISTING_USERS[@]}"; do
+        user="${EXISTING_USERS[$i]}"
+        alias="${EXISTING_ALIASES[$i]}"
+        cfg="${EXISTING_CFGS[$i]}"
+        name="${EXISTING_NAMES[$i]}"
+        email="${EXISTING_EMAILS[$i]}"
+        dir="${EXISTING_DIRS[$i]}"
+        key="${EXISTING_KEYS[$i]}"
+        echo
+        echo "账号: $user"
+        echo "  Host 别名   : ${alias:-(未识别)}"
+        echo "  gitconfig   : ${cfg:-(未识别)}"
+        echo "  Git 显示名  : ${name:-(未识别)}"
+        echo "  Git 邮箱    : ${email:-(未识别)}"
+        echo "  代码目录    : ${dir:-(未识别)}"
+        echo "  SSH 私钥    : ${key:-(未识别)}"
+        echo "  URL 改写    : git@github.com:${user}/... -> git@${alias}:${user}/..."
+    done
 }
 
 # 在数组里找第一个不等于某值的元素,用于给"公司"选一个不等于"个人"的候选
@@ -344,7 +386,7 @@ pick_delete_target() {
     echo
     echo "可输入: 序号 / GitHub 用户名 / Host 别名"
     while true; do
-        read -r -p "删除哪个账号配置?: " a
+        read_or_exit "删除哪个账号配置?: " a
         if [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le "${#DELETE_ALIASES[@]}" ]; then
             DELETE_ALIAS="${DELETE_ALIASES[$((a-1))]}"
             DELETE_USER="${DELETE_USERS[$((a-1))]}"
@@ -905,6 +947,11 @@ detect_existing
 if [ "$MODE" = "delete" ]; then
     pick_delete_target
     delete_account_config "$DELETE_USER" "$DELETE_ALIAS" "$DELETE_GH_USER"
+    exit 0
+fi
+
+if [ "$MODE" = "view" ]; then
+    view_current_config
     exit 0
 fi
 
