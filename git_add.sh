@@ -2,12 +2,12 @@
 #
 # setup-github-multi-account.sh
 # ----------------------------------------------------------------
-# 在 macOS 上为 GitHub 个人账号 + 公司账号 做一次性配置:
-#   1. 为两个账号生成独立的 SSH key(已存在则跳过,绝不覆盖)
+# 在 macOS 上为 GitHub 多账号做配置(可重复执行,逐个新增账号):
+#   1. 为新增账号生成独立 SSH key(已存在则跳过,绝不覆盖)
 #   2. 在 ~/.ssh/config 添加 github.com-<GitHub用户名> 别名
-#   3. 配置 git 用 includeIf 按目录自动切换 commit 身份
-#   4. 把 key 加载到 ssh-agent + macOS Keychain
-#   5. 引导通过 gh CLI 登录两个账号,并把公钥上传到 GitHub
+#   3. 配置 git includeIf 按目录自动切换 commit 身份
+#   4. 把新增账号 key 加载到 ssh-agent + macOS Keychain
+#   5. 引导通过 gh CLI 登录新增账号,并把公钥上传到 GitHub
 #
 # 对已有配置的处理:
 #   - 运行前先探测现有配置(gh 登录账号、git global name/email、常见 SSH key
@@ -43,7 +43,9 @@ backup_file() {
 read_or_exit() {
     local prompt="$1" out_var="$2" value=""
     read -r -p "$prompt" value
-    if [ "$value" = $'\e' ]; then
+    local value_upper=""
+    value_upper="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+    if [ "$value" = $'\e' ] || [ "$value" = "^[" ] || [ "$value_upper" = "ESC" ]; then
         echo
         warn "检测到 ESC，已退出脚本。"
         exit 0
@@ -102,6 +104,16 @@ cfg_path_by_alias() {
     fi
 }
 
+resolve_cfg_for_user() {
+    local user="$1" c n
+    for c in "$HOME/.gitconfig-${user}" "$HOME/.gitconfig-personal" "$HOME/.gitconfig-work"; do
+        [ -f "$c" ] || continue
+        n="$(git config -f "$c" --get user.name 2>/dev/null || true)"
+        [ -n "$n" ] && [ "$n" = "$user" ] && { printf '%s' "$c"; return; }
+    done
+    printf '%s' "$HOME/.gitconfig-${user}"
+}
+
 detect_managed_accounts() {
     local alias user gh_user cfg email name key dir i found existing_alias
     EXISTING_ALIASES=()
@@ -116,6 +128,7 @@ detect_managed_accounts() {
         [ -z "$alias" ] && continue
         user="${alias#github.com-}"
         cfg="$(cfg_path_by_alias "$alias")"
+        [ ! -f "$cfg" ] && cfg="$(resolve_cfg_for_user "$user")"
         name="$(git config -f "$cfg" --get user.name 2>/dev/null || true)"
         gh_user=""
         if [ "$alias" = "github.com-personal" ] || [ "$alias" = "github.com-work" ]; then
@@ -292,7 +305,7 @@ choose_mode() {
     echo "================================================================"
     echo "  运行模式"
     echo "================================================================"
-    echo "  1) 配置/更新双账号(默认)"
+    echo "  1) 新增账号(可重复执行,支持多账号)"
     echo "  2) 删除某一个账号的配置"
     echo "  3) 查看当前配置(只读)"
     read_or_exit "请选择 [1/2/3]: " m
@@ -332,7 +345,7 @@ view_current_config() {
     done
 }
 
-# 在数组里找第一个不等于某值的元素,用于给"公司"选一个不等于"个人"的候选
+# 在数组里找第一个不等于某值的元素
 first_other() {
     local exclude="$1"; shift
     local x
@@ -340,6 +353,47 @@ first_other() {
         [ -n "$x" ] && [ "$x" != "$exclude" ] && { printf '%s' "$x"; return; }
     done
     return 0
+}
+
+user_in_existing() {
+    local user="$1" i
+    for i in "${!EXISTING_USERS[@]}"; do
+        [ "$user" = "${EXISTING_USERS[$i]}" ] && return 0
+    done
+    return 1
+}
+
+build_target_accounts() {
+    local i alias cfg
+    TARGET_USERS=()
+    TARGET_NAMES=()
+    TARGET_EMAILS=()
+    TARGET_DIRS=()
+    TARGET_KEYS=()
+    TARGET_ALIASES=()
+    TARGET_CFGS=()
+
+    for i in "${!EXISTING_USERS[@]}"; do
+        alias="${EXISTING_ALIASES[$i]}"
+        [ -z "$alias" ] && alias="github.com-${EXISTING_USERS[$i]}"
+        cfg="${EXISTING_CFGS[$i]}"
+        [ -z "$cfg" ] && cfg="$HOME/.gitconfig-${EXISTING_USERS[$i]}"
+        TARGET_USERS+=("${EXISTING_USERS[$i]}")
+        TARGET_NAMES+=("${EXISTING_NAMES[$i]:-${EXISTING_USERS[$i]}}")
+        TARGET_EMAILS+=("${EXISTING_EMAILS[$i]}")
+        TARGET_DIRS+=("${EXISTING_DIRS[$i]}")
+        TARGET_KEYS+=("${EXISTING_KEYS[$i]}")
+        TARGET_ALIASES+=("$alias")
+        TARGET_CFGS+=("$cfg")
+    done
+
+    TARGET_USERS+=("$NEW_USER")
+    TARGET_NAMES+=("$NEW_NAME")
+    TARGET_EMAILS+=("$NEW_EMAIL")
+    TARGET_DIRS+=("$NEW_DIR")
+    TARGET_KEYS+=("$NEW_KEY")
+    TARGET_ALIASES+=("$NEW_ALIAS")
+    TARGET_CFGS+=("$NEW_CFG")
 }
 
 pick_delete_target() {
@@ -411,137 +465,88 @@ collect_inputs() {
     echo "================================================================"
     echo "  GitHub 多账号配置 (macOS)"
     echo "================================================================"
-    LOCK_EXISTING_FIRST=0
-    MIGRATE_EXISTING_ALIAS=0
-    LEGACY_EXISTING_ALIAS=""
-    if [ ${#EXISTING_USERS[@]} -ge 2 ]; then
-        err "已检测到 ${#EXISTING_USERS[@]} 个已配置账号。为避免误改,本模式不再覆盖已有账号。"
-        err "如需替换账号,请先用删除模式删掉一个再新增。"
+    info "当前已配置 ${#EXISTING_USERS[@]} 个账号；本次将新增 1 个账号。"
+    if [ ${#EXISTING_USERS[@]} -gt 0 ]; then
+        local i
+        for i in "${!EXISTING_USERS[@]}"; do
+            echo "  - ${EXISTING_USERS[$i]} <${EXISTING_EMAILS[$i]:-(未识别)}>"
+        done
+    fi
+
+    local default_new_user=""
+    local candidate
+    if [ ${#DETECTED_GH_ACCOUNTS[@]} -gt 0 ]; then
+        for candidate in "${DETECTED_GH_ACCOUNTS[@]}"; do
+            if ! user_in_existing "$candidate"; then
+                default_new_user="$candidate"
+                break
+            fi
+        done
+    fi
+
+    echo
+    echo "--- 新增账号 ---"
+    NEW_USER=$(ask "GitHub 用户名" "$default_new_user")
+    if user_in_existing "$NEW_USER"; then
+        err "账号 $NEW_USER 已存在。请使用删除模式移除后再重建，或输入其他用户名。"
         exit 1
     fi
 
-    if [ ${#EXISTING_USERS[@]} -eq 1 ]; then
-        LOCK_EXISTING_FIRST=1
-        PERSONAL_USER="${EXISTING_USERS[0]}"
-        LEGACY_EXISTING_ALIAS="${EXISTING_ALIASES[0]}"
-        PERSONAL_ALIAS="github.com-${PERSONAL_USER}"
-        PERSONAL_CFG="${EXISTING_CFGS[0]}"
-        PERSONAL_NAME="${EXISTING_NAMES[0]:-$PERSONAL_USER}"
-        PERSONAL_EMAIL="${EXISTING_EMAILS[0]}"
-        PERSONAL_KEY="${EXISTING_KEYS[0]}"
-        PERSONAL_DIR="${EXISTING_DIRS[0]}"
-        [ -n "$PERSONAL_DIR" ] && [[ "$PERSONAL_DIR" != */ ]] && PERSONAL_DIR="${PERSONAL_DIR}/"
-        if [ "$LEGACY_EXISTING_ALIAS" != "$PERSONAL_ALIAS" ]; then
-            MIGRATE_EXISTING_ALIAS=1
-        fi
-        info "检测到已存在账号: $PERSONAL_USER，将保持不变并直接添加账号2。"
-        echo "  已有账号: $PERSONAL_USER <${PERSONAL_EMAIL:-(未识别)}>"
-        if [ "$MIGRATE_EXISTING_ALIAS" = "1" ]; then
-            echo "           Host 将从 $LEGACY_EXISTING_ALIAS 迁移为 $PERSONAL_ALIAS"
-        fi
-        echo "           目录: ${PERSONAL_DIR:-(未识别)}"
-        echo "           key : ${PERSONAL_KEY:-(未识别)}"
-    else
-        # 如果有多个 gh 账号,先给账号1一个默认值
-        local default_personal_user=""
-        if [ ${#DETECTED_GH_ACCOUNTS[@]} -ge 1 ]; then
-            default_personal_user="${DETECTED_GH_ACCOUNTS[0]}"
-        fi
-        if [ ${#DETECTED_GH_ACCOUNTS[@]} -ge 2 ]; then
-            info "检测到多个 gh 账号,默认把 ${DETECTED_GH_ACCOUNTS[0]} 作为账号1。"
-            info "如不是请在下面手输 GitHub 用户名。"
-        fi
-
-        # 账号1 SSH key 默认:已有 key 优先,否则给一个按用户名命名的新路径
-        local default_personal_key="$HOME/.ssh/id_ed25519_personal"
-        if [ -f "$HOME/.ssh/id_ed25519_personal" ]; then
-            default_personal_key="$HOME/.ssh/id_ed25519_personal"
-        elif [ -f "$HOME/.ssh/id_ed25519" ]; then
-            default_personal_key="$HOME/.ssh/id_ed25519"
-        elif [ -f "$HOME/.ssh/id_rsa" ]; then
-            default_personal_key="$HOME/.ssh/id_rsa"
-        fi
-
-        echo
-        echo "--- 账号1 ---"
-        PERSONAL_USER=$(ask "GitHub 用户名" "$default_personal_user")
-        local personal_cfg_by_user="$HOME/.gitconfig-${PERSONAL_USER}"
-        local personal_name_by_user=""
-        local personal_email_by_user=""
-        if [ -f "$personal_cfg_by_user" ]; then
-            personal_name_by_user=$(git config -f "$personal_cfg_by_user" --get user.name 2>/dev/null || true)
-            personal_email_by_user=$(git config -f "$personal_cfg_by_user" --get user.email 2>/dev/null || true)
-        fi
-        local default_personal_dir="$HOME/code/${PERSONAL_USER}"
-        local default_personal_key_by_user="$HOME/.ssh/id_ed25519_${PERSONAL_USER}"
-        [ -f "$default_personal_key_by_user" ] && default_personal_key="$default_personal_key_by_user"
-        PERSONAL_NAME=$(ask  "Git 显示名"   "${personal_name_by_user:-${PREV_PERSONAL_NAME:-${DETECTED_GIT_NAME:-$PERSONAL_USER}}}")
-        PERSONAL_EMAIL=$(ask "Git 邮箱"     "${personal_email_by_user:-${PREV_PERSONAL_EMAIL:-$DETECTED_GIT_EMAIL}}")
-        PERSONAL_DIR=$(ask   "代码目录(此目录下的仓库自动用该账号身份)" "$default_personal_dir")
-        PERSONAL_KEY=$(ask   "SSH 私钥路径" "$default_personal_key")
-        PERSONAL_ALIAS="github.com-${PERSONAL_USER}"
-        PERSONAL_CFG="$HOME/.gitconfig-${PERSONAL_USER}"
+    local cfg_by_user="$HOME/.gitconfig-${NEW_USER}"
+    local default_name="$NEW_USER"
+    local default_email="$DETECTED_GIT_EMAIL"
+    local existing_name=""
+    local existing_email=""
+    if [ -f "$cfg_by_user" ]; then
+        existing_name=$(git config -f "$cfg_by_user" --get user.name 2>/dev/null || true)
+        existing_email=$(git config -f "$cfg_by_user" --get user.email 2>/dev/null || true)
     fi
+    [ -n "$existing_name" ] && default_name="$existing_name"
+    [ -z "$existing_name" ] && [ -n "$DETECTED_GIT_NAME" ] && default_name="$DETECTED_GIT_NAME"
+    [ -n "$existing_email" ] && default_email="$existing_email"
 
-    # 账号2默认:从 gh 账号里挑一个不等于账号1的
-    local default_work_user=""
-    if [ ${#DETECTED_GH_ACCOUNTS[@]} -ge 1 ]; then
-        default_work_user=$(first_other "$PERSONAL_USER" "${DETECTED_GH_ACCOUNTS[@]}")
-    fi
+    NEW_NAME=$(ask "Git 显示名" "$default_name")
+    NEW_EMAIL=$(ask "Git 邮箱" "$default_email")
+    NEW_DIR=$(ask "代码目录(此目录下的仓库自动用该账号身份)" "$HOME/code/${NEW_USER}")
+    NEW_KEY=$(ask "SSH 私钥路径" "$HOME/.ssh/id_ed25519_${NEW_USER}")
+
+    NEW_DIR="${NEW_DIR/#\~/$HOME}"
+    NEW_KEY="${NEW_KEY/#\~/$HOME}"
+    [[ "$NEW_DIR" != */ ]] && NEW_DIR="${NEW_DIR}/"
+    NEW_ALIAS="github.com-${NEW_USER}"
+    NEW_CFG="$HOME/.gitconfig-${NEW_USER}"
+
+    local i ed ekey eemail
+    for i in "${!EXISTING_USERS[@]}"; do
+        ekey="${EXISTING_KEYS[$i]}"
+        ed="${EXISTING_DIRS[$i]}"
+        eemail="${EXISTING_EMAILS[$i]}"
+        [ -n "$ed" ] && [[ "$ed" != */ ]] && ed="${ed}/"
+        if [ -n "$ekey" ] && [ "$NEW_KEY" = "$ekey" ]; then
+            err "SSH key 路径与已有账号冲突: $ekey"
+            exit 1
+        fi
+        if [ -n "$ed" ] && [ "$NEW_DIR" = "$ed" ]; then
+            err "代码目录与已有账号冲突: $ed"
+            exit 1
+        fi
+        if [ -n "$eemail" ] && [ "$NEW_EMAIL" = "$eemail" ]; then
+            warn "新账号邮箱与已有账号 ${EXISTING_USERS[$i]} 相同，不推荐。"
+            confirm "仍然继续?" || exit 1
+            break
+        fi
+    done
+
+    build_target_accounts
 
     echo
-    echo "--- 账号2 ---"
-    WORK_USER=$(ask "GitHub 用户名" "$default_work_user")
-    local work_cfg_by_user="$HOME/.gitconfig-${WORK_USER}"
-    local work_name_by_user=""
-    local work_email_by_user=""
-    if [ -f "$work_cfg_by_user" ]; then
-        work_name_by_user=$(git config -f "$work_cfg_by_user" --get user.name 2>/dev/null || true)
-        work_email_by_user=$(git config -f "$work_cfg_by_user" --get user.email 2>/dev/null || true)
-    fi
-    WORK_NAME=$(ask  "Git 显示名"   "${work_name_by_user:-${PREV_WORK_NAME:-$WORK_USER}}")
-    WORK_EMAIL=$(ask "Git 邮箱"     "${work_email_by_user:-$PREV_WORK_EMAIL}")
-    WORK_DIR=$(ask   "代码目录(此目录下的仓库自动用该账号身份)" "$HOME/code/${WORK_USER}")
-    WORK_KEY=$(ask   "SSH 私钥路径" "$HOME/.ssh/id_ed25519_${WORK_USER}")
-
-    # 展开 ~,规范化
-    PERSONAL_DIR="${PERSONAL_DIR/#\~/$HOME}"
-    WORK_DIR="${WORK_DIR/#\~/$HOME}"
-    PERSONAL_KEY="${PERSONAL_KEY/#\~/$HOME}"
-    WORK_KEY="${WORK_KEY/#\~/$HOME}"
-    [[ "$PERSONAL_DIR" != */ ]] && PERSONAL_DIR="${PERSONAL_DIR}/"
-    [[ "$WORK_DIR" != */ ]] && WORK_DIR="${WORK_DIR}/"
-
-    # 冲突检查
-    if [ -n "$PERSONAL_KEY" ] && [ "$PERSONAL_KEY" = "$WORK_KEY" ]; then
-        err "两个账号的 SSH key 路径不能相同"; exit 1
-    fi
-    if [ -n "$PERSONAL_DIR" ] && [ "$PERSONAL_DIR" = "$WORK_DIR" ]; then
-        err "两个账号的代码目录不能相同"; exit 1
-    fi
-    if [ "$PERSONAL_USER" = "$WORK_USER" ]; then
-        err "两个账号的 GitHub 用户名不能相同"; exit 1
-    fi
-    if [ -n "$PERSONAL_EMAIL" ] && [ "$PERSONAL_EMAIL" = "$WORK_EMAIL" ]; then
-        warn "两个账号使用了相同邮箱,不推荐(GitHub 贡献图会归到同一个账号)"
-        confirm "仍然继续?" || exit 1
-    fi
-
-    WORK_ALIAS="github.com-${WORK_USER}"
-    WORK_CFG="$HOME/.gitconfig-${WORK_USER}"
-
-    echo
-    info "即将应用的配置:"
-    if [ "$LOCK_EXISTING_FIRST" = "1" ]; then
-        echo "  账号1(保持不变): $PERSONAL_USER <$PERSONAL_EMAIL>"
-    else
-        echo "  账号1: $PERSONAL_USER <$PERSONAL_EMAIL>"
-    fi
-    echo "        目录: $PERSONAL_DIR"
-    echo "        key : $PERSONAL_KEY"
-    echo "  账号2: $WORK_USER <$WORK_EMAIL>"
-    echo "        目录: $WORK_DIR"
-    echo "        key : $WORK_KEY"
+    info "即将新增账号:"
+    echo "  用户名: $NEW_USER"
+    echo "  显示名: $NEW_NAME"
+    echo "  邮箱  : $NEW_EMAIL"
+    echo "  目录  : $NEW_DIR"
+    echo "  key   : $NEW_KEY"
+    echo "  Host  : $NEW_ALIAS"
     echo
     confirm "确认继续?" || { err "已取消"; exit 1; }
 }
@@ -552,23 +557,13 @@ setup_ssh_keys() {
     info "=== 1/7 准备 SSH key ==="
     mkdir -p "$HOME/.ssh"
     chmod 700 "$HOME/.ssh"
-
-    local specs=()
-    if [ "${LOCK_EXISTING_FIRST:-0}" = "1" ]; then
-        specs=("WORK|$WORK_KEY|$WORK_EMAIL")
+    if [ -f "$NEW_KEY" ]; then
+        ok "已存在 $NEW_KEY — 沿用,不重新生成"
     else
-        specs=("PERSONAL|$PERSONAL_KEY|$PERSONAL_EMAIL" "WORK|$WORK_KEY|$WORK_EMAIL")
+        info "生成 $NEW_KEY (ed25519, 无密码;要带密码请 Ctrl-C 后先手动 ssh-keygen)"
+        ssh-keygen -t ed25519 -C "$NEW_EMAIL" -f "$NEW_KEY" -N "" -q
+        ok "已生成 $NEW_KEY"
     fi
-    for spec in "${specs[@]}"; do
-        IFS='|' read -r tag key email <<<"$spec"
-        if [ -f "$key" ]; then
-            ok "已存在 $key — 沿用,不重新生成"
-        else
-            info "生成 $key (ed25519, 无密码;要带密码请 Ctrl-C 后先手动 ssh-keygen)"
-            ssh-keygen -t ed25519 -C "$email" -f "$key" -N "" -q
-            ok "已生成 $key"
-        fi
-    done
 }
 
 setup_ssh_config() {
@@ -581,62 +576,43 @@ setup_ssh_config() {
 
     {
         printf '\n%s\n' "$MARKER_BEGIN"
-        cat <<EOF
-# 由 setup-github-multi-account.sh 生成 — 此 block 会在脚本重跑时被整体替换
-
-Host $PERSONAL_ALIAS
+        echo "# 由 setup-github-multi-account.sh 生成 — 此 block 会在脚本重跑时被整体替换"
+        echo
+        local i alias key
+        for i in "${!TARGET_USERS[@]}"; do
+            alias="${TARGET_ALIASES[$i]}"
+            key="${TARGET_KEYS[$i]}"
+            [ -z "$alias" ] && continue
+            [ -z "$key" ] && continue
+            cat <<EOF
+Host $alias
   HostName github.com
   User git
-  IdentityFile $PERSONAL_KEY
+  IdentityFile $key
   IdentitiesOnly yes
   AddKeysToAgent yes
   UseKeychain yes
 
-Host $WORK_ALIAS
-  HostName github.com
-  User git
-  IdentityFile $WORK_KEY
-  IdentitiesOnly yes
-  AddKeysToAgent yes
-  UseKeychain yes
 EOF
+        done
         printf '%s\n' "$MARKER_END"
     } >> "$cfg"
 
-    ok "已写入 Host 别名:$PERSONAL_ALIAS、$WORK_ALIAS"
+    ok "已写入 ${#TARGET_USERS[@]} 个 Host 别名"
 }
 
 setup_git_config() {
     info "=== 3/7 配置 git (~/.gitconfig 的 includeIf) ==="
 
     local main="$HOME/.gitconfig"
-    local personal_cfg="$PERSONAL_CFG"
-    local work_cfg="$WORK_CFG"
-
-    if [ "${LOCK_EXISTING_FIRST:-0}" != "1" ]; then
-        backup_file "$personal_cfg"
-    fi
-    backup_file "$work_cfg"
-
-    if [ "${LOCK_EXISTING_FIRST:-0}" != "1" ]; then
-        cat > "$personal_cfg" <<EOF
-# 个人账号身份 — 由 setup-github-multi-account.sh 管理
+    backup_file "$NEW_CFG"
+    cat > "$NEW_CFG" <<EOF
+# 账号身份 — 由 setup-github-multi-account.sh 管理
 [user]
-    name = $PERSONAL_NAME
-    email = $PERSONAL_EMAIL
+    name = $NEW_NAME
+    email = $NEW_EMAIL
 EOF
-        ok "已写入 $personal_cfg"
-    else
-        ok "保留已有账号配置不变: $PERSONAL_USER"
-    fi
-
-    cat > "$work_cfg" <<EOF
-# 公司账号身份 — 由 setup-github-multi-account.sh 管理
-[user]
-    name = $WORK_NAME
-    email = $WORK_EMAIL
-EOF
-    ok "已写入 $work_cfg"
+    ok "已写入 $NEW_CFG"
 
     touch "$main"
     backup_file "$main"
@@ -644,19 +620,25 @@ EOF
     if grep -qE '^\[user\]' "$main" 2>/dev/null; then
         warn "~/.gitconfig 已有 [user] 配置,将保留不动。"
         warn "→ 两个目录之外的仓库仍然会用它作为默认身份。"
-        warn "→ 建议所有仓库都放进 $PERSONAL_DIR 或 $WORK_DIR 下,由 includeIf 接管。"
+        warn "→ 建议受管仓库放进对应账号目录下,由 includeIf 接管。"
     fi
 
     remove_marker_block "$main"
     {
         printf '\n%s\n' "$MARKER_BEGIN"
-        cat <<EOF
-# 按目录自动切换 git 身份 — 由 setup-github-multi-account.sh 管理
-[includeIf "gitdir:$PERSONAL_DIR"]
-    path = $personal_cfg
-[includeIf "gitdir:$WORK_DIR"]
-    path = $work_cfg
+        echo "# 按目录自动切换 git 身份 — 由 setup-github-multi-account.sh 管理"
+        local i dir cfgp
+        for i in "${!TARGET_USERS[@]}"; do
+            dir="${TARGET_DIRS[$i]}"
+            cfgp="${TARGET_CFGS[$i]}"
+            [ -z "$dir" ] && continue
+            [ -z "$cfgp" ] && continue
+            [[ "$dir" != */ ]] && dir="${dir}/"
+            cat <<EOF
+[includeIf "gitdir:$dir"]
+    path = $cfgp
 EOF
+        done
         printf '%s\n' "$MARKER_END"
     } >> "$main"
 
@@ -667,27 +649,21 @@ setup_git_url_rewrite() {
     info "=== 4/7 配置 git URL 自动改写 (insteadOf) ==="
 
     # 防手滑: 输入 git@github.com:<user>/repo.git 时,自动改写到对应 Host 别名
-    if [ "${LOCK_EXISTING_FIRST:-0}" != "1" ] || [ "${MIGRATE_EXISTING_ALIAS:-0}" = "1" ]; then
-        git config --global "url.git@${PERSONAL_ALIAS}:${PERSONAL_USER}/.insteadOf" "git@github.com:${PERSONAL_USER}/"
-    fi
-    git config --global "url.git@${WORK_ALIAS}:${WORK_USER}/.insteadOf" "git@github.com:${WORK_USER}/"
-
-    if [ "${MIGRATE_EXISTING_ALIAS:-0}" = "1" ]; then
-        remove_url_rewrite_by_regex "^url\\.git@${LEGACY_EXISTING_ALIAS}:.*\\.insteadOf$"
-        ok "已迁移已有账号 URL 改写规则: $LEGACY_EXISTING_ALIAS -> $PERSONAL_ALIAS"
-    elif [ "${LOCK_EXISTING_FIRST:-0}" != "1" ]; then
-        ok "已配置: git@github.com:${PERSONAL_USER}/... -> git@${PERSONAL_ALIAS}:${PERSONAL_USER}/..."
-    else
-        ok "保留已有账号 URL 改写规则不变: $PERSONAL_USER"
-    fi
-    ok "已配置: git@github.com:${WORK_USER}/... -> git@${WORK_ALIAS}:${WORK_USER}/..."
+    local i user alias
+    for i in "${!TARGET_USERS[@]}"; do
+        user="${TARGET_USERS[$i]}"
+        alias="${TARGET_ALIASES[$i]}"
+        [ -z "$user" ] && continue
+        [ -z "$alias" ] && continue
+        git config --global "url.git@${alias}:${user}/.insteadOf" "git@github.com:${user}/"
+    done
+    ok "已配置/刷新 ${#TARGET_USERS[@]} 个账号的 URL 改写规则"
 }
 
 setup_directories() {
     info "=== 5/7 创建代码目录 ==="
-    mkdir -p "$PERSONAL_DIR" "$WORK_DIR"
-    ok "目录就绪:$PERSONAL_DIR"
-    ok "目录就绪:$WORK_DIR"
+    mkdir -p "$NEW_DIR"
+    ok "目录就绪:$NEW_DIR"
 }
 
 setup_ssh_agent() {
@@ -698,68 +674,51 @@ setup_ssh_agent() {
     fi
     eval "$(ssh-agent -s)" >/dev/null 2>&1 || true
 
-    local keys=()
-    if [ "${LOCK_EXISTING_FIRST:-0}" = "1" ]; then
-        keys=("$WORK_KEY")
+    if ssh-add "$keychain_flag" "$NEW_KEY" 2>/dev/null; then
+        ok "已加载 $NEW_KEY"
     else
-        keys=("$PERSONAL_KEY" "$WORK_KEY")
-    fi
-    for key in "${keys[@]}"; do
-        if ssh-add "$keychain_flag" "$key" 2>/dev/null; then
-            ok "已加载 $key"
+        if ssh-add "$NEW_KEY" 2>/dev/null; then
+            ok "已加载 $NEW_KEY (无密码,未写 Keychain)"
         else
-            if ssh-add "$key" 2>/dev/null; then
-                ok "已加载 $key (无密码,未写 Keychain)"
-            else
-                warn "加载 $key 失败,稍后可手动:ssh-add $keychain_flag $key"
-            fi
+            warn "加载 $NEW_KEY 失败,稍后可手动:ssh-add $keychain_flag $NEW_KEY"
         fi
-    done
+    fi
 }
 
 setup_gh_cli() {
     info "=== 7/7 gh CLI 登录 + 上传公钥 ==="
     echo
-    echo "下面依次引导登录 个人 / 公司 账号,已登录过的会自动跳过。"
+    echo "下面引导登录新增账号,已登录过会自动跳过。"
     echo
 
-    local specs=()
-    if [ "${LOCK_EXISTING_FIRST:-0}" = "1" ]; then
-        specs=("账号2|$WORK_USER|$WORK_KEY")
+    echo
+    info "--- 新增账号 ($NEW_USER) ---"
+
+    if gh auth status 2>&1 | grep -q "account $NEW_USER"; then
+        ok "$NEW_USER 已登录,跳过 gh auth login"
     else
-        specs=("账号1|$PERSONAL_USER|$PERSONAL_KEY" "账号2|$WORK_USER|$WORK_KEY")
-    fi
-    for spec in "${specs[@]}"; do
-        IFS='|' read -r label user key <<<"$spec"
-        echo
-        info "--- $label 账号 ($user) ---"
-
-        if gh auth status 2>&1 | grep -q "account $user"; then
-            ok "$user 已登录,跳过 gh auth login"
+        if confirm "现在打开浏览器登录账号 ($NEW_USER)?"; then
+            if ! gh auth login --hostname github.com --git-protocol ssh --web; then
+                warn "登录失败或被取消,稍后可手动:gh auth login"
+                return 0
+            fi
         else
-            if confirm "现在打开浏览器登录 $label 账号 ($user)?"; then
-                if ! gh auth login --hostname github.com --git-protocol ssh --web; then
-                    warn "登录失败或被取消,稍后可手动:gh auth login"
-                    continue
-                fi
-            else
-                warn "跳过 $label 账号的登录"
-                continue
-            fi
+            warn "跳过登录"
+            return 0
         fi
+    fi
 
-        gh auth switch --user "$user" >/dev/null 2>&1 || true
+    gh auth switch --user "$NEW_USER" >/dev/null 2>&1 || true
 
-        local title="$(scutil --get ComputerName 2>/dev/null || hostname -s)-$label"
-        if confirm "上传公钥 ${key}.pub 到 $user 的 GitHub (title: $title)?"; then
-            if gh ssh-key add "${key}.pub" --title "$title"; then
-                ok "公钥已上传到 $user"
-            else
-                warn "上传失败(可能 key 已在 GitHub 上,或 token 缺 admin:public_key 权限)"
-                warn "可手动到 https://github.com/settings/keys 粘贴 ${key}.pub 内容"
-            fi
+    local title="$(scutil --get ComputerName 2>/dev/null || hostname -s)-$NEW_USER"
+    if confirm "上传公钥 ${NEW_KEY}.pub 到 $NEW_USER 的 GitHub (title: $title)?"; then
+        if gh ssh-key add "${NEW_KEY}.pub" --title "$title"; then
+            ok "公钥已上传到 $NEW_USER"
+        else
+            warn "上传失败(可能 key 已在 GitHub 上,或 token 缺 admin:public_key 权限)"
+            warn "可手动到 https://github.com/settings/keys 粘贴 ${NEW_KEY}.pub 内容"
         fi
-    done
+    fi
 }
 
 extract_identityfile_for_host() {
@@ -908,30 +867,23 @@ print_summary() {
  🎉 配置完成
 ================================================================
 
-日常使用:
+本次新增账号:
+  $NEW_USER <$NEW_EMAIL>
+  Host: $NEW_ALIAS
+  目录: $NEW_DIR
+  key : $NEW_KEY
 
-  # 切换 gh CLI 的当前账号(影响 gh pr / gh repo 等命令)
+当前脚本管理账号总数: ${#TARGET_USERS[@]}
+
+常用命令:
   gh auth switch
-  gh auth status        # 查看当前登录的所有账号
-
-  # clone 账号1仓库(注意 host 写成 $PERSONAL_ALIAS)
-  cd $PERSONAL_DIR
-  git clone git@$PERSONAL_ALIAS:$PERSONAL_USER/REPO.git
-
-  # clone 账号2仓库
-  cd $WORK_DIR
-  git clone git@$WORK_ALIAS:ORG_OR_USER/REPO.git
-
-  # 已有仓库改 remote:
-  git remote set-url origin git@$WORK_ALIAS:ORG/REPO.git
+  gh auth status
+  cd $NEW_DIR
+  git clone git@$NEW_ALIAS:$NEW_USER/REPO.git
 
 快速验证:
-
-  ssh -T git@$PERSONAL_ALIAS   # 应显示: Hi $PERSONAL_USER!
-  ssh -T git@$WORK_ALIAS       # 应显示: Hi $WORK_USER!
-
-  cd $PERSONAL_DIR && git config user.email    # → $PERSONAL_EMAIL
-  cd $WORK_DIR     && git config user.email    # → $WORK_EMAIL
+  ssh -T git@$NEW_ALIAS
+  cd $NEW_DIR && git config user.email    # → $NEW_EMAIL
 
 备份的旧配置文件在对应路径下以 .bak.YYYYMMDD_HHMMSS 结尾。
 脚本可以反复执行,是幂等的。
