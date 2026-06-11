@@ -394,6 +394,20 @@ build_target_accounts() {
     TARGET_KEYS+=("$NEW_KEY")
     TARGET_ALIASES+=("$NEW_ALIAS")
     TARGET_CFGS+=("$NEW_CFG")
+
+    DEFAULT_GITHUB_USER=""
+    DEFAULT_GITHUB_KEY=""
+    for i in "${!TARGET_USERS[@]}"; do
+        if [ -n "${DETECTED_GIT_NAME:-}" ] && [ "$DETECTED_GIT_NAME" = "${TARGET_USERS[$i]}" ]; then
+            DEFAULT_GITHUB_USER="${TARGET_USERS[$i]}"
+            DEFAULT_GITHUB_KEY="${TARGET_KEYS[$i]}"
+            break
+        fi
+    done
+    if [ -z "$DEFAULT_GITHUB_KEY" ] && [ ${#TARGET_KEYS[@]} -gt 0 ]; then
+        DEFAULT_GITHUB_USER="${TARGET_USERS[0]}"
+        DEFAULT_GITHUB_KEY="${TARGET_KEYS[0]}"
+    fi
 }
 
 pick_delete_target() {
@@ -578,6 +592,19 @@ setup_ssh_config() {
         printf '\n%s\n' "$MARKER_BEGIN"
         echo "# 由 setup-github-multi-account.sh 生成 — 此 block 会在脚本重跑时被整体替换"
         echo
+        if [ -n "${DEFAULT_GITHUB_KEY:-}" ]; then
+            cat <<EOF
+# 普通 git@github.com:ORG/REPO.git 仓库使用默认账号,避免新增账号影响旧仓库 push。
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile $DEFAULT_GITHUB_KEY
+  IdentitiesOnly yes
+  AddKeysToAgent yes
+  UseKeychain yes
+
+EOF
+        fi
         local i alias key
         for i in "${!TARGET_USERS[@]}"; do
             alias="${TARGET_ALIASES[$i]}"
@@ -599,6 +626,9 @@ EOF
     } >> "$cfg"
 
     ok "已写入 ${#TARGET_USERS[@]} 个 Host 别名"
+    if [ -n "${DEFAULT_GITHUB_KEY:-}" ]; then
+        ok "已设置默认 github.com 身份: ${DEFAULT_GITHUB_USER:-未知} ($DEFAULT_GITHUB_KEY)"
+    fi
 }
 
 setup_git_config() {
